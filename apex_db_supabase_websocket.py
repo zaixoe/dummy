@@ -1,4 +1,3 @@
-
 import os
 import sys
 import time
@@ -8,7 +7,6 @@ import requests
 import threading
 import traceback
 import telegram
-import websocket # pip install websocket-client
 import ssl
 import numpy as np
 import tulipy as ti
@@ -16,7 +14,7 @@ import json
 import math
 import logging
 import psycopg2
-import websockets
+import websocket
 from threading import Thread, Event
 from queue import Queue
 from datetime import datetime, timedelta
@@ -24,7 +22,6 @@ from urllib.parse import urlencode
 from dotenv import load_dotenv
 from flask import Flask
 from collections import deque
-
 
 # --- Tambahan untuk Database ---
 from psycopg2 import sql
@@ -428,30 +425,69 @@ def calculate_indicators(candle_data):
 
 # --- [Baru] KELAS KLIEN WEBSOCKET INDODAX ---
 class IndodaxWebSocketClient:
-    def __init__(self, message_queue: Queue, pairs_to_subscribe: list):
-        self.websocket_url = "wss://ws.indodax.com/ws/"
+    def __init__(self, message_queue: Queue, pairs_to_subscribe: list): # Hapus websocket_token dari sini
+        self.websocket_url = "wss://ws3.indodax.com/ws/"
         self.message_queue = message_queue
-        self.pairs_to_subscribe = pairs_to_subscribe # Contoh: ['btc_idr', 'eth_idr']
+        self.pairs_to_subscribe = pairs_to_subscribe 
         self.ws = None
         self.thread = None
         self.running = False
-        self.reconnect_interval = 10 # Detik
-        self.keep_alive_interval = 30 # Detik, untuk ping/pong
+        self.reconnect_interval = 10 
+        self.keep_alive_interval = 30 
         self.last_pong_time = time.time()
         self.last_ping_time = time.time()
         self.stop_event = Event()
+        self.authenticated_and_subscribed = False
         logger.info(f"IndodaxWebSocketClient initialized for pairs: {pairs_to_subscribe}")
+        
+    def _on_open(self, ws):
+        logger.info("WebSocket connection opened. Subscribing to kline channels...")
+        
+        # Reset flag saat koneksi dibuka
+        self.authenticated_and_subscribed = True # Langsung set ke True karena tidak ada autentikasi terpisah
+        
+        # HAPUS BAGIAN PENGIRIMAN AUTHENTIKASI INI:
+        # auth_message = {
+        #     "params": {
+        #         "token": self.websocket_token
+        #     },
+        #     "id": 1
+        # }
+        # ws.send(json.dumps(auth_message))
+        # logger.info("Authentication message sent. Waiting for response...")
+        
+        # Sekarang kirim semua pesan subscribe
+        for pair in self.pairs_to_subscribe:
+            formatted_pair = pair.replace('_', '')
+            subscribe_message = {
+                "channel": f"kline_{formatted_pair}_{CANDLE_INTERVAL_MINUTES}m",
+                "event": "subscribe"
+            }
+            ws.send(json.dumps(subscribe_message))
+            logger.info(f"Subscribed to {subscribe_message['channel']}")
+        
+        # Mulai ping loop
+        self.last_pong_time = time.time()
+        self.last_ping_time = time.time()
+        self._send_ping_loop()
 
     def _on_message(self, ws, message):
         try:
             data = json.loads(message)
+            
             if 'channel' in data and data['channel'].startswith('kline_'):
+                # Pastikan sudah terautentikasi dan berlangganan sebelum memproses kline
+                # Meskipun server biasanya tidak akan mengirim jika belum, ini adalah cek keamanan
+                if not self.authenticated_and_subscribed:
+                    logger.warning(f"Received kline data before full authentication/subscription. Skipping. Message: {message}")
+                    return
+
                 # Data kline diterima, masukkan ke antrean
                 self.message_queue.put({'type': 'kline', 'data': data})
                 # logger.debug(f"Received kline data for {data.get('pair')}/{data.get('interval')}: {data.get('data', {}).get('close')}")
             elif 'pong' in data:
                 self.last_pong_time = time.time()
-                # logger.debug("Received WebSocket pong.")
+                logger.debug("Received WebSocket pong.") # Now explicitly log this for debugging
             elif 'channel' in data and data['channel'] == 'system' and 'message' in data and 'connected' in data['message']:
                 logger.info(f"WebSocket system message: {data['message']}")
             else:
@@ -468,22 +504,8 @@ class IndodaxWebSocketClient:
     def _on_close(self, ws, close_status_code, close_msg):
         logger.warning(f"WebSocket connection closed. Code: {close_status_code}, Msg: {close_msg}. Attempting to reconnect...")
         self.running = False # Tandai bahwa perlu reconnect
+        self.authenticated_and_subscribed = False
 
-    def _on_open(self, ws):
-        logger.info("WebSocket connection opened. Subscribing to channels...")
-        # Subscribe ke channel kline untuk setiap pair yang ditentukan
-        for pair in self.pairs_to_subscribe:
-            subscribe_message = {
-                "channel": f"kline_{pair}_{CANDLE_INTERVAL_MINUTES}m", # Menggunakan CANDLE_INTERVAL_MINUTES global
-                "event": "subscribe"
-            }
-            ws.send(json.dumps(subscribe_message))
-            logger.info(f"Subscribed to {subscribe_message['channel']}")
-        
-        # Mulai loop keep-alive (ping/pong)
-        self.last_pong_time = time.time()
-        self.last_ping_time = time.time()
-        self._send_ping_loop()
 
     def _send_ping_loop(self):
         if self.stop_event.is_set():
@@ -491,7 +513,7 @@ class IndodaxWebSocketClient:
             return
 
         try:
-            if self.ws and self.ws.connected:
+            if self.ws and self.ws.sock and self.ws.sock.status == websocket.STATUS_NORMAL:
                 # Periksa apakah ada pong yang diterima baru-baru ini
                 if time.time() - self.last_pong_time > self.reconnect_interval * 2: # Jika tidak ada pong dalam 2x interval reconnect
                     logger.warning("No pong received for a long time, forcing WebSocket reconnect.")
@@ -499,13 +521,11 @@ class IndodaxWebSocketClient:
                     return
 
                 if time.time() - self.last_ping_time > self.keep_alive_interval:
-                    self.ws.send(json.dumps({"ping": time.time()}))
-                    self.last_ping_time = time.time()
-                    # logger.debug("Sent WebSocket ping.")
+                    logger.debug("Relying on websocket-client's built-in ping mechanism.")
             else:
-                logger.debug("WebSocket not connected, skipping ping.")
+                logger.debug("WebSocket not connected or sock not available, skipping ping.")
         except Exception as e:
-            logger.error(f"Error in WebSocket ping loop: {e}")
+            logger.error(f"Error in WebSocket ping loop: {e}. Trace: {traceback.format_exc()}")
         
         # Jadwalkan ping berikutnya
         if not self.stop_event.is_set():
@@ -513,9 +533,11 @@ class IndodaxWebSocketClient:
 
 
     def _run_websocket(self):
+        logger.info("WebSocket run_websocket thread started.") # Add this
+        ssl_context = ssl.create_default_context()
         while not self.stop_event.is_set():
-            if not self.running:
-                logger.info("Starting new WebSocket connection...")
+            if not self.running: 
+                logger.info("Attempting to start new WebSocket connection...") # Change for clarity
                 try:
                     self.ws = websocket.WebSocketApp(
                         self.websocket_url,
@@ -524,21 +546,23 @@ class IndodaxWebSocketClient:
                         on_error=self._on_error,
                         on_close=self._on_close
                     )
-                    # Menggunakan sslopt={"cert_reqs": ssl.CERT_NONE} TIDAK dianjurkan untuk produksi
-                    # Seharusnya kita memverifikasi sertifikat SSL.
-                    # Tapi jika ada masalah koneksi karena sertifikat di lingkungan tertentu,
-                    # ini bisa dicoba. Lebih baik memastikan root CAs terupdate di OS.
-                    # self.ws.run_forever(dispatcher=websocket.Dispatcher(), sslopt={"cert_reqs": ssl.CERT_NONE})
-                    self.ws.run_forever(dispatcher=websocket.Dispatcher(), ping_interval=self.keep_alive_interval, ping_timeout=self.keep_alive_interval/2)
-                    self.running = True # Hanya diset true jika run_forever tidak langsung error
+                    logger.debug(f"Calling run_forever for URL: {self.websocket_url}") # New debug log
+                    self.ws.run_forever(
+                        ping_interval=self.keep_alive_interval,
+                        ping_timeout=self.keep_alive_interval/2,
+                        sslopt={"cert_reqs": ssl.CERT_REQUIRED, "context": ssl_context} # Explicitly use default context
+                    )
+                    logger.info("run_forever exited normally (connection closed).") # New log
+                    self.running = True 
                 except Exception as e:
-                    logger.error(f"Failed to establish WebSocket connection: {e}. Retrying in {self.reconnect_interval} seconds.")
+                    logger.error(f"Critical error during WebSocket run_forever: {e}. Retrying in {self.reconnect_interval} seconds. Trace: {traceback.format_exc()}") # More detail
                     self.running = False
                 
                 if not self.running and not self.stop_event.is_set():
                     time.sleep(self.reconnect_interval)
             else:
-                time.sleep(1) # Tunggu sebentar jika running tapi masih di loop
+                time.sleep(1)
+        logger.info("WebSocket run_websocket thread stopping.")
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():
@@ -618,6 +642,7 @@ class IndodaxTradingBot:
         while not self.message_queue.empty():
             try:
                 message = self.message_queue.get(block=False)
+                logger.debug(f"Processing message from queue: Type={message.get('type')}, Pair={message.get('data', {}).get('pair')}")
                 if message['type'] == 'kline':
                     kline_data = message['data']
                     pair = kline_data.get('pair')
@@ -656,6 +681,7 @@ class IndodaxTradingBot:
                                 'timestamp': None, 'open': None, 'high': None, 'low': None, 'prices_in_interval': []
                             }
                         }
+                        logger.info(f"[{pair}] Initializing new candle_database entry.")
                     
                     candles_deque = self.candle_database[pair]['candles']
                     
@@ -665,7 +691,7 @@ class IndodaxTradingBot:
                     if candles_deque and candles_deque[-1]['timestamp'] == new_candle['timestamp']:
                         # Update lilin terakhir (jika ini adalah update lilin yang sedang berjalan)
                         candles_deque[-1] = new_candle
-                        # logger.debug(f"[{pair}] Updated running candle. C:{new_candle['close']:.0f}")
+                        logger.debug(f"[{pair}] Updated running candle. C:{new_candle['close']:.0f}. Deque size: {len(candles_deque)}")
                     else:
                         # Ini adalah lilin baru atau lilin yang baru saja selesai
                         # Jika lilin yang baru saja selesai, pastikan tidak ada duplikasi
@@ -675,7 +701,7 @@ class IndodaxTradingBot:
                             candles_deque.append(new_candle)
                             logger.info(f"[{pair}] ADDED new candle. O:{new_candle['open']:.0f} H:{new_candle['high']:.0f} L:{new_candle['low']:.0f} C:{new_candle['close']:.0f} at {datetime.fromtimestamp(new_candle['timestamp']).strftime('%H:%M')}. Deque size: {len(candles_deque)}")
                         # else:
-                            # logger.debug(f"[{pair}] Duplicate or older candle received. Current last: {datetime.fromtimestamp(candles_deque[-1]['timestamp']).strftime('%H:%M')}, New: {datetime.fromtimestamp(new_candle['timestamp']).strftime('%H:%M')}. Skipping.")
+                            logger.debug(f"[{pair}] Duplicate or older candle received. Current last: {datetime.fromtimestamp(candles_deque[-1]['timestamp']).strftime('%H:%M')}, New: {datetime.fromtimestamp(new_candle['timestamp']).strftime('%H:%M')}. Skipping.")
 
                 else:
                     logger.warning(f"Unknown message type received from WebSocket: {message['type']}")
@@ -1084,7 +1110,7 @@ class IndodaxTradingBot:
         kirim_notifikasi_telegram(radar_message)
         self.last_radar_report_time = current_time
         logger.info("Market Radar Report sent.")
-
+        
     def run(self):
         """Metode utama untuk menjalankan loop bot."""
         logger.info(f"--- [INDODAX BOT] Memulai bot v35 (Penyempurnaan Demigod + WebSocket)... ---")
@@ -1118,12 +1144,12 @@ class IndodaxTradingBot:
         
         # Ambil semua pair yang qualified dari initial_market_summaries
         self.websocket_pairs_subscribed = list(initial_market_summaries.keys())
-        # Pastikan tidak ada duplikasi dan hanya yang relevan
         self.websocket_pairs_subscribed = list(set(self.websocket_pairs_subscribed))
         
         # Inisialisasi dan mulai WebSocket client
-        if self.websocket_client is None: # Hanya inisialisasi sekali
-            self.websocket_client = IndodaxWebSocketClient(self.message_queue, self.websocket_pairs_subscribed)
+        if self.websocket_client is None:
+            # PENTING: JANGAN PASS self.websocket_token DI SINI
+            self.websocket_client = IndodaxWebSocketClient(self.message_queue, self.websocket_pairs_subscribed) 
             self.websocket_client.start()
             logger.info(f"IndodaxWebSocketClient started for {len(self.websocket_pairs_subscribed)} pairs.")
         # --- AKHIR INISIALISASI WEBSOCKET ---
@@ -1227,6 +1253,12 @@ class IndodaxTradingBot:
                     # Logika ini perlu diperbaiki karena lilin datang dari WS sekarang.
                     # Jika tidak ada lilin sama sekali, berarti WS belum memberikan data
                     # atau tidak ada pair yang memenuhi `warmup_period_length`
+                    for pair_debug, data_entry_debug in self.candle_database.items():
+                        if 'candles' in data_entry_debug:
+                            logger.debug(f"DEBUG: {pair_debug} has {len(data_entry_debug['candles'])} candles.")
+                        else:
+                            logger.debug(f"DEBUG: {pair_debug} has no 'candles' key.")
+                    
                     total_candles_processed = sum(len(d['candles']) for d in self.candle_database.values())
                     logger.info(f"[INFO] Sedang dalam fase pemanasan WebSocket. Total lilin terkumpul: {total_candles_processed}. Membutuhkan {warmup_period_length} lilin per pair untuk indikator.")
                     time.sleep(main_loop_sleep_duration)
@@ -1381,4 +1413,3 @@ if __name__ == "__main__":
     port = int(os.environ.get('PORT', 5000))
     
     app.run(host='0.0.0.0', port=port, use_reloader=False)
-
