@@ -457,14 +457,11 @@ class IndodaxWebSocketClient:
         # logger.info("Authentication message sent. Waiting for response...")
         
         # Sekarang kirim semua pesan subscribe
-        for pair in self.pairs_to_subscribe:
-            formatted_pair = pair.replace('_', '')
-            subscribe_message = {
-                "channel": f"kline_{formatted_pair}_{CANDLE_INTERVAL_MINUTES}m",
-                "event": "subscribe"
-            }
-            ws.send(json.dumps(subscribe_message))
-            logger.info(f"Subscribed to {subscribe_message['channel']}")
+        for pair in self.subscribed_pairs:
+    # Perubahan di sini: Hapus .replace('_', '')
+            channel_name = f"kline_{pair.lower()}_{interval}"
+            self.ws.send(json.dumps({"method": f"subscribe_{channel_name}", "params":[], "id": 1}))
+            self.logger.info(f"Subscribed to {channel_name}")
         
         # Mulai ping loop
         self.last_pong_time = time.time()
@@ -599,6 +596,15 @@ class IndodaxTradingBot:
         # Awalnya mungkin kosong, nanti akan diisi saat bot mulai mendapatkan summaries
         self.websocket_pairs_subscribed = [] 
         self.websocket_client = None # Akan diinisialisasi nanti di `run` setelah mendapatkan daftar pairs
+        self.websocket_pairs = []
+        self.websocket_pairs = self._fetch_initial_market_summaries() 
+        self.logger.info(f"IndodaxWebSocketClient initialized for pairs: {self.websocket_pairs}")
+        self.ws_client = IndodaxWebSocketClient(
+            pairs=self.websocket_pairs,
+            interval=self.kline_interval,
+            logger=self.logger
+        )
+        self.ws_client.start()
 
         # Muat state bot jika ada
         loaded_state = load_bot_state_from_db('bot_main_state')
